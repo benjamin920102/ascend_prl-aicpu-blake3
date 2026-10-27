@@ -1,0 +1,12 @@
+/* One batched AICPU task per strip; no per-tile launch or GM spin polling. */
+#include "aicpu_api.h"
+#include "pearl_blake3.h"
+
+__global__ __aicpu__ uint32_t pearl_blake3_aicpu(void* rawArgs)
+{
+    const auto& args = *static_cast<const PearlBlake3Args*>(rawArgs);
+    const uint32_t status = PearlBlake3Scan(args);
+    // Make hit/no-hit stores visible before the following D2H and completion event.
+    AscendC::DataStoreBarrier();
+    return status;
+}

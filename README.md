@@ -1,0 +1,150 @@
+# `ascend_prl` — the world's first Ascend NPU cryptocurrency miner
+
+[![No Maintenance Intended](http://unmaintained.tech/badge.svg)](http://unmaintained.tech/)
+
+**English** | [中文](README_zh.md)
+
+A from-scratch miner for the [Pearl](https://arxiv.org/abs/2504.09971) Proof-of-**Useful**-Work
+coin on Huawei **Ascend 910B** NPUs. Tested on a 910B4; it does **~10 TH/s/device end-to-end**.
+
+> **DISCLAMER:** for educational purpose only. Use only with hardware you are authorized to.
+
+This AICPU variant uses the existing four-slot asynchronous host pipeline. Vector
+folds cube partials and exports transcripts to GM; one batched AICPU task per
+strip performs keyed BLAKE3 and target comparison on a separate stream. The
+AICPU variant has not yet been compiled with CANN or benchmarked on a device in
+this editing environment. Build as before with `make RANK=128`; no additional
+make flags or runtime opt-in are needed. See [AICPU_BLAKE3.md](AICPU_BLAKE3.md).
+
+## Quickstart
+
+1. **Create a Pearl wallet.** Use the [official wallet](https://github.com/pearl-research-labs/pearl/releases/tag/pearl-wallet-v2.0.0)
+   and follow their instructions. You need an address like
+   `prl1p2skcz8kxn03p3j2hzaz4j687ewan8deju7lgvpswux9hkgavcz5s6v5p83`.
+2. **Choose a pool.** Any standard `stratum` Pearl pool should work. These sources are tested with
+   [Kryptex](https://pool.kryptex.com/prl). Note: different pools accept proofs for different M, N, K (see [Performance](#performance-and-shapes)).
+3. **Run it** — one of:
+   **Option 1 — Docker** (recommended):
+   ```bash
+   docker pull arabel1a/ascend_prl
+   docker run --rm -it --privileged --network host \
+     -v /usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64 \
+     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+     -v /etc/ascend_install.info:/etc/ascend_install.info \
+     -v /usr/local/dcmi:/usr/local/dcmi \
+     -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+     -e WALLET=prl1...your_wallet -e POOL=pool.host -e PORT=7000 \
+     -e ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+     arabel1a/ascend_prl:latest
+   ```
+   The image ships the CANN runtime only; the host supplies the NPU driver
+   (`libascend_hal.so`), so the `-v /usr/local/Ascend/driver/...` mounts and `--privileged`
+   are **required** for the miner to reach the NPUs. Set `ASCEND_RT_VISIBLE_DEVICES` to the
+   dies you want. For Chinese users: pull through a
+   [Docker Hub mirror](https://github.com/dongyubin/DockerHub) that proxies user repos, e.g.:
+   ```bash
+   docker pull docker.1panel.live/arabel1a/ascend_prl   # fastest mirror tested for this repo (CN-only)
+   ```
+   
+   **Option 2 — pre-built binary** (Linux/aarch64 + CANN runtime required):
+   ```bash
+   git clone https://github.com/arabel1a/ascend_prl.git && cd ascend_prl
+   ./scripts/get_release.sh                 # or grab them from the Releases page
+   export WALLET=prl1...your_wallet
+   export POOL=pool.host   PORT=7000        # your pool's stratum host/port
+   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 ./scripts/launch.sh
+   ```
+   **Option 3 — build it yourself.** See [Build](#build).
+
+## Coexistence with other NPU workloads
+
+Run the miner on the same dies as other processes and have it automatically get out of the way:
+when another process enters the device, miner stops automatically. No need to restart manually.
+Enable it by setting **`PRL_COEXIST_GUARD=1`** when you launch:
+
+```bash
+PRL_COEXIST_GUARD=1 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./scripts/launch.sh
+# Docker: add  -e PRL_COEXIST_GUARD=1  to your run (scripts/run_container.sh passes it through)
+```
+
+## Build
+
+Requirements: 
+- CANN 9.0.0 toolchain + Ascend-C compiler 
+- `gcc` with `-march=armv8-a+crypto` (NEON BLAKE3)
+- `cmake ≥ 3.16`.
+- BLAKE3 C sources (the `blake3-1.x/c` dir — vendored, or from the cargo registry).
+- cargo, The Pearl Rust workspace (`pearl-blake3`, `zk-pow`) for the proof FFI — adjust the paths in
+  `proof-ffi/Cargo.toml` to your checkout.
+
+```bash
+make                     # default RANK=128; builds build/{ascend_prl_kryptex, ascend_prl_k1, libpearl_hlc2.so, libpearl_proof.so}
+```
+
+Build flags (`make VAR=...`):
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `RANK` | `128` | Noise rank / kernel config. Current public pools accept `128` (K=4096). |
+| `MDIM` | `16384` | 16384 keeps the pool's block-proof fast (non-orphaning). |
+
+## Performance and shapes
+
+The cube unit can not perform XORs and shifts, and the vector is bad at multiplying matrices. Thus we need to transfer
+each k-partial from cube to vector through L2 (2TB/s aggregated). This limits TH/s ~ OP/s / 2 = (memory bandwidth) * (fold arithmetic intensity). We transfer 8/r bytes in total -> arithmetic intensity = r/8. So the silicone peak TH/s is rank / 8 TH/s.
+
+Coin specs allow r up to 1024, but k >=r * 16, ZK-proof size and check time scales linearly with k. Thin increase block processing time, and therefore - probability of orphan blocks. Current public pools accept only r=128. Other ranks are kept only for custom/non-pool experiments.
+
+> Note that **Ascend 310** and **950** do not have these limitations and can (theoretically) reach closer to hardware peak TOP/s.
+
+## GZIP v2 + custom share difficulty (Kryptex)
+
+Network traffic for share submits is reduced **~80–100×** by the Pearl stratum gzip protocol
+([spec](https://gist.github.com/maxmalysh/eaaf4332dbc5ca99d0a78f24a733fffe)):
+
+1. `mining.authorize` sends `"type":"v2"`. When the pool echoes `"type":"v2"`, the miner submits
+   `base64(gzip(bincode(plain_proof)))` instead of the ~136 KB plain base64 proof (~15 KB compressed).
+2. Matrix A/B are **zero-seeded** by default (plus an 8-byte seed stamp) so the proof is highly
+   repetitive and actually compresses. Uniform random data does not. Override with `PRL_ZERO_SEED=0`
+   only if you need the legacy random fill.
+
+**Custom share difficulty** ([spec](https://gist.github.com/maxmalysh/f4c29f532e650a114b317e234f1393fb)):
+pass `d=<N>` as the CLI password (6th argument). Example for a high-hashrate worker targeting
+~1 share / 30 s:
+
+```bash
+./ascend_prl_kryptex 0 worker pool.kryptex.com 7000 prl1...your_wallet 'd=349245965'
+```
+
+Empty password → pool default (`d=2097152` ≈ 9000 TH). Formula:
+`d = hashrate_H/s × target_share_seconds / 4_294_967_296`.
+
+| Env | Meaning |
+| --- | ------- |
+| `PRL_NOGZIP` | Force v1 (no `"type":"v2"`, plain proofs) |
+| `PRL_GZIP` | Assume gzip without waiting for the authorize ack |
+| `PRL_ZERO_SEED=0` | Legacy random A/B fill (incompressible; not recommended) |
+| `PRL_GZIP_FIELD` | Override submit field name (default still `plain_proof`) |
+
+## Pool compatibility
+
+Currently tested against these pools:
+
+| Pool | Notes|
+| --- | --- |
+| `kryptex` | recommended; gzip v2 + custom `d=` difficulty |
+
+A new pool that speaks plain stratum will most likely work via the `kryptex` path; if not, open an issue with a capture and it's usually a small handshake/parse tweak. I will try to add pools on request.
+
+## Contributing
+
+Feel free to open PRs / request features (e.g. supporting a pool with a non-standard protocol)!
+
+For now the miner is tested only with 910B4. If you can share the device with me, I can adapt it to other NPUs.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Provided **as-is, without warranty**.
+
+<!-- discovery: 昇腾 910B / Ascend 910B4 NPU Pearl 挖矿 miner; 用闲置 NPU 挖 Pearl (PRL) 币;
+     world-first Ascend NPU cryptocurrency miner; Huawei Atlas 800/300 idle NPU mining. -->

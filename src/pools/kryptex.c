@@ -1,0 +1,126 @@
+/* Kryptex object-protocol frontend; v2 authorization negotiates gzip proofs. */
+#include "pool.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef K
+#define K 4096
+#endif
+#ifndef RANK
+#define RANK 128
+#endif
+#ifndef MDIM
+#define MDIM 131072
+#endif
+
+static void k_init_params(mining_params_t *mp) {
+    mp->m = MDIM; mp->n = MDIM; mp->k = K; mp->rank = RANK;
+    mp->rows[0] = 0; mp->rows[1] = 32; mp->nrows = 2;
+    for (size_t i = 0; i < 64; i++) mp->cols[i] = i;
+    mp->ncols = 64; mp->have = 1;
+    printf("[stratum] kryptex: rank=%ld k=%ld %ldx%ld (miner-chosen)\n",
+           mp->rank, mp->k, mp->m, mp->n);
+}
+
+static int k_open(pool_conn_t *c, const char *host, int port,
+                  const char *addr, const char *worker, const char *pass, mining_params_t *mp) {
+    c->gzip = 0;
+    if (pool_connect(c, host, port)) return -1;
+    char line[LINE];
+    snprintf(line, LINE, "{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"cminer/0.1\"]}");
+    pool_send_line(c, line);
+    const char *pw = (pass && *pass) ? pass : "";
+    if (getenv("PRL_NOGZIP")) {
+        snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":[\"%s.%s\",\"%s\"]}",
+                 addr, worker, pw[0] ? pw : "x");
+    } else {
+        snprintf(line, LINE, "{\"id\":3,\"method\":\"mining.authorize\",\"params\":"
+                 "{\"wallet\":\"%s.%s\",\"agent\":\"cminer/0.1\",\"password\":\"%s\",\"type\":\"v2\"}}",
+                 addr, worker, pw);
+    }
+    pool_send_line(c, line);
+    if (getenv("PRL_GZIP") && !getenv("PRL_NOGZIP")) c->gzip = 1;
+    pool_start_reader(c, mp);
+    return 0;
+}
+
+static void k_handle_notify(pool_conn_t *c, const char *line) {
+    char jid[JOBLEN], hdr[2 * HDRLEN + 1], tgt[80];
+    if (jstr(line, "header", hdr, sizeof hdr)) return;
+    if (jstr(line, "job_id", jid, sizeof jid)) return;
+    long height = (long)jnum(line, "height", 0);
+    int cert_version = (int)jnum(line, "cert_version", 1);
+    uint8_t ptarget[32]; int have_t = 0;
+    if (!jstr(line, "target", tgt, sizeof tgt)) {
+        memset(ptarget, 0, 32);
+        int tn = hex2bin(tgt, ptarget, 32);
+        if (tn > 0) {
+            // Pool targets may omit leading zero bytes.
+            if (tn < 32) {
+                memmove(ptarget + (32 - tn), ptarget, tn);
+                memset(ptarget, 0, 32 - tn);
+            }
+            have_t = 1;
+        }
+    }
+    uint8_t decoded_header[HDRLEN];
+    int decoded_len = hex2bin(hdr, decoded_header, sizeof decoded_header);
+    if (decoded_len <= 0) return;
+    pthread_mutex_lock(&job_mu);
+    strncpy(c->job.job_id, jid, JOBLEN - 1);
+    c->job.job_id[JOBLEN - 1] = 0;
+    memcpy(c->job.header, decoded_header, (size_t)decoded_len);
+    c->job.header_len = (size_t)decoded_len;
+    c->job.height = height;
+    c->job.cert_version = cert_version;
+    if (have_t) { memcpy(c->job.ptarget, ptarget, 32); c->job.have_target = 1; }
+    c->job.have = 1;
+    pthread_mutex_unlock(&job_mu);
+    printf("[stratum]%s job %s height=%ld%s\n", c->tag, jid, height, have_t ? " (target set)" : "");
+}
+
+static void k_dispatch(pool_conn_t *c, const char *line, mining_params_t *mp) {
+    (void)mp;
+    if (getenv("PRL_RAW")) fprintf(stderr, "[raw<]%s %.500s\n", c->tag, line);
+    char meth[48] = "";
+    jstr(line, "method", meth, sizeof meth);
+    if (!strcmp(meth, "mining.notify")) k_handle_notify(c, line);
+    else if (!strcmp(meth, "mining.set_difficulty")) {
+        const char *p = jfind(line, "params");
+        if (p && *p == '[') c->job.difficulty = atof(p + 1);
+        printf("[stratum]%s difficulty %.0f\n", c->tag, c->job.difficulty);
+    } else if (strstr(line, "\"result\"")) {
+        char ty[8] = "";
+        if (!jstr(line, "type", ty, sizeof ty) && !strcmp(ty, "v2") && !getenv("PRL_NOGZIP")) {
+            if (!c->gzip) printf("[stratum]%s gzip proof negotiated (type:v2)\n", c->tag);
+            c->gzip = 1;
+        }
+        pool_handle_result(c, line);
+    }
+}
+
+static void k_build_target(const job_t *J, int tile_h, long rounded_k, uint32_t out[8]) {
+    target_from_be(J->ptarget, (long)tile_h * 64 * rounded_k, out);
+}
+
+static int k_submit_prefix(pool_conn_t *c, const char *addr, const char *worker,
+                           const char *job_id, char *msg, size_t cap, const char **tail) {
+    *tail = "\"}}";
+    // Only a negotiated gzip session may override the proof field name.
+    const char *field = "plain_proof";
+    if (c->gzip) { const char *e = getenv("PRL_GZIP_FIELD"); if (e && *e) field = e; }
+    return snprintf(msg, cap, "{\"id\":%d,\"method\":\"mining.submit\",\"params\":"
+                    "{\"worker\":\"%s.%s\",\"job_id\":\"%s\",\"%s\":\"",
+                    ++c->msg_id, addr, worker, job_id, field);
+}
+
+const pool_frontend_t POOL = {
+    .name = "kryptex",
+    .miner_chosen_params = 1,
+    .init_params = k_init_params,
+    .open = k_open,
+    .dispatch = k_dispatch,
+    .build_target = k_build_target,
+    .submit_prefix = k_submit_prefix,
+};

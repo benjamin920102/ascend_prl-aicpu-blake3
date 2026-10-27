@@ -15,8 +15,9 @@ make RANK=128
 
 本次輸出是原始碼 ZIP，未包含預編譯執行檔。需要 CANN 9.0.0 的完整編譯元件，
 包括 AICPU CMake 支援、`aicpu_api.h` 與對應 device library。此編輯環境沒有
-CANN/BiSheng 或 Ascend NPU，所以尚未驗證 CANN 完整編譯、裝置載入、跨引擎
-記憶體可見性與實機 iter/s；主機端測試不能取代這些驗證。
+CANN/BiSheng 或 Ascend NPU。使用者已回報第一版可以完成編譯與啟動，並在
+scan-ready event reset 處回傳 207000。本次修正版的完整執行、跨引擎記憶體
+可見性與實機 iter/s 仍待設備驗證；主機端測試不能取代這些驗證。
 
 ## 運作方式
 
@@ -35,7 +36,8 @@ CANN/BiSheng 或 Ascend NPU，所以尚未驗證 CANN 完整編譯、裝置載�
 - AICPU 每次清除全部 live hit record，最多在 record 0 發布一個有效 hit，
   並以 `AscendC::DataStoreBarrier()` 完成結果寫入。
 - Host 的槽位完成事件位於 AICPU 與結果 D2H 之後；四個槽位都必須等這個事件
-  才能重用。跨 stream 的同步 event 在唯一 consumer stream 等待後 reset。
+  才能重用。跨 stream 的同步 event 由 `aclrtCreateEventExWithFlag` 建立，
+  僅以 `RecordEvent` 再次記錄來重用，不呼叫不支援的 `aclrtResetEvent`。
 - `PRL_NOFOLD` 仍僅供診斷，輸出原本的 accumulator prefix；AICPU 跳過 hash，
   清除 hit，不會把無效 transcript 當成有效 share。
 
@@ -63,7 +65,8 @@ ASAN_OPTIONS=detect_leaks=0 /tmp/test_aicpu_blake3
 
 ## 實機確認
 
-1. 用原 GitHub Actions 編譯；啟動時應看到 `hash=AICPU`。
+1. 用原 GitHub Actions 編譯；啟動時應同時看到 `hash=AICPU` 與
+   `events=Ex/no-reset-v2`，可確認實際載入的是本次修正版。
 2. 與原版在同一設備、相同 pool/job shape、相同執行條件下比較穩定後 iter/s。
 3. 確認 share 仍通過既有 proof/pool 驗證，沒有新增 invalid share 或 timeout。
 4. 若使用 profiler，應看到 `pearl_blake3_aicpu` 與下一個 Vector kernel 的重疊。
@@ -71,8 +74,24 @@ ASAN_OPTIONS=detect_leaks=0 /tmp/test_aicpu_blake3
 這是單一 batched AICPU 任務的版本；AICPU 吞吐與排程成本可能成為新瓶頸，
 效能改善必須實測。
 
+## 207000 event 修正
+
+第一版誤將 `aclrtCreateEventExWithFlag(..., ACL_EVENT_SYNC)` 建立的事件傳給
+`aclrtResetEvent`。這種 Ex event 不支援 reset；支援的重用方式是重新 record，
+wait 呼叫則取得當次已記錄的 stream progress。
+
+本次同時移除 scan-ready 與 fold-ready 的兩處 reset，保留以下時序：
+
+- scan-ready：Cube stream record → Vector stream wait；下一次 scan 前須排空槽位。
+- fold-ready：Vector stream record → AICPU stream wait → hash → D2H → slot done。
+- Host 等到 slot done 才能重用該槽位、重新記錄它的 fold-ready event。
+
+未新增 host 同步等待、編譯開關或效能插樁。Makefile、GitHub Actions、BLAKE3
+與 fold 迴圈的運算沒有因本次 event 修正而改變。
+
 ## 參考
 
 - [CANN 9.0 AI CPU Operator Compilation](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00050.html)
 - [DataStoreBarrier](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/AI-CPU-API/DataStoreBarrier.md)
 - [官方 BLAKE3 test vectors](https://github.com/BLAKE3-team/BLAKE3/blob/master/test_vectors/test_vectors.json)
+- [CANN Runtime Event 管理：Ex event 限制與 re-record 語義](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/07_event_management.md)

@@ -1,97 +1,77 @@
-# AICPU BLAKE3 版本
+# AICPU 僅前處理，Vector 完成 BLAKE3
 
-## 編譯與執行
+沿用原 GitHub Actions 的 CANN 9.0.0 與 `make RANK=128`，不需新增編譯參數或開關。
+啟動標記：`hash=Vector prep=AICPU/HBM prep_bytes=128 prep_scope=scan events=Ex/no-reset-v3`。
 
-沿用原本 GitHub Actions 的 CANN 9.0.0 安裝與編譯指令：
+## 分工
+
+| 執行端 | 工作 | 頻率 |
+| --- | --- | --- |
+| AICPU | 初始 compression state、第一輪 4 個 key-only 加法、target | 每次更新 key/target 一次 |
+| HBM/GM | 保存 128-byte prepared context，直到全部 strip 完成 | 同一個 scan 共用 |
+| Vector scalar | 讀取 context，對 transcript 完成七輪 mixing 與 target comparison | 每 kernel 讀一次 context；每 tile hash 一次 |
+| Vector 向量單元 | 原本的 Add、fold、rotate、XOR | 與原版相同 |
+
+HBM context 的 word offset：
+
+| Offset | 內容 |
+| --- | --- |
+| 0–15 | 8 個 key words、4 個 IV words、counter=0、length=64、flags=27 |
+| 16–19 | `key[i] + key[i+4]`，unsigned 32-bit modulo 加法 |
+| 20–27 | little-endian target limbs |
+| 28–31 | 0 padding |
+
+AICPU 不讀 transcript，不執行 message mixing，也不掃描 hit。Vector 使用預算的
+4 個 key sums 開始第一輪 column mixing，再完成第一輪 diagonal mixing 與其餘六輪。
+每個 hash 共省下 4 個 key-only 加法。這是很小的前處理，不能視為移走大部分 hash 工作，
+也不能保證比原本的純 Vector 版更快。
+
+## 同步與生命週期
+
+1. 先前 scan 的 strip queue 排空後，才允許更新 key/target。
+2. `pearl_set_key_target` 將 key/target 快照傳入 `pearl_blake3_precompute`，每 scan
+   一次；AICPU 在獨立 prep stream 寫入 HBM，呼叫 `DataStoreBarrier()` 後記錄 prep-ready。
+3. Vector stream 分別等待 flag reset 與 prep-ready。Cube 的 Matmul 可以同時開始。
+4. 每個 Vector kernel 開始時刷新 context 的 scalar cache line，將 initial state、key
+   sums 與 target 讀入私有 scalar 陣列，之後所有 tile 共用，不再逐 tile/strip 等待 AICPU。
+5. Vector 完成 fold/hash、結果 D2H 後記錄原有完成事件。全部 strip 完成前不覆寫 context。
+
+兩個同步事件都以 `aclrtCreateEventExWithFlag(..., ACL_EVENT_SYNC)` 建立，透過重新
+`RecordEvent` 重用，不呼叫 `aclrtResetEvent`，保留 207000 修正。
+
+正式路徑的 transcript 留在 UB；新增 HBM 資料只有 128 bytes 的 prepared context。
+完整 transcript GM 配置與 D2H 僅在原本診斷 API 要求時使用。原本的 partial ring、
+fold loop、`PIPE_V` 排程、look-ahead prefetch 與 per-worker hit 編碼保留。
+
+## 驗證
+
+- 官方 64-byte keyed BLAKE3 test vector 通過。
+- 與原始上傳版本的完整 Vector BLAKE3 差分比較：4,096 組隨機 key/input/target
+  加 2 組邊界，每組 4 個 transcript，共 16,392 個 hash，全部相同。
+- 128-byte ABI、counter/length/flags、32-bit 加法溢位、target 更新與 padding 檢查通過。
+- 主機端 AddressSanitizer、UndefinedBehaviorSanitizer 測試通過。
+- Makefile 與 GitHub Actions 與原上傳檔逐 byte 相同；fold loop 運算與 barrier 排程相同。
+
+可選的主機端測試指令（不影響正式 make 流程）：
 
 ```bash
-make RANK=128
+g++ -std=c++11 -O2 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer tests/test_blake3_precompute.cpp -o /tmp/test_blake3_precompute
+ASAN_OPTIONS=detect_leaks=0 /tmp/test_blake3_precompute
 ```
 
-不需要增加 make 參數、CMake 開關或環境變數。既有 Makefile 與
-`.github/workflows/main.yml` 完全保留。CMake 會自動使用 AICPU 語言編譯
-`kernel/pearl_blake3.aicpu`，並由 ASC linker 與原本的兩個 Ascend C kernel
-一起封裝到 `build/libpearl_hlc2.so`。
+LeakSanitizer 因本次環境的 `/proc` 限制關閉；ASan 與 UBSan 仍啟用。
+此編輯環境沒有 CANN/BiSheng 與 NPU，本次版本的完整編譯、跨引擎記憶體可見性、
+share 驗證與實機 iter/s 仍需設備驗證。先前完整 AICPU hash 版本已由使用者回報較慢。
 
-本次輸出是原始碼 ZIP，未包含預編譯執行檔。需要 CANN 9.0.0 的完整編譯元件，
-包括 AICPU CMake 支援、`aicpu_api.h` 與對應 device library。此編輯環境沒有
-CANN/BiSheng 或 Ascend NPU。使用者已回報第一版可以完成編譯與啟動，並在
-scan-ready event reset 處回傳 207000。本次修正版的完整執行、跨引擎記憶體
-可見性與實機 iter/s 仍待設備驗證；主機端測試不能取代這些驗證。
+## 監測數據
 
-## 運作方式
-
-- Cube 的 Matmul、4-slot GM partial ring 與 producer/consumer flag 協定保留。
-- Vector 保留原有 fold 運算與迴圈內 `PIPE_V` barrier 排程，移除
-  `GetValue`、scalar BLAKE3 與 target comparison。
-- Vector 使用兩塊 4 KiB 的 VECOUT queue buffer 輸出 transcript，避免下一個 band
-  覆寫 MTE3 還在讀取的 UB。總 UB 配置約 152 KiB。
-- 每個 strip 的完整 transcript 使用獨立 GM 槽位，布局仍為
-  `[band][16 words][64 columns]`。診斷 API 的 transcript 布局不變。
-- Vector 完成 strip i 後記錄 fold-ready event，AICPU stream 等待該 event，
-  再執行一次整批 hash。Vector 可同時繼續 strip i+1；每個 tile 不另行啟動任務。
-- AICPU 取得 launch arguments 中的 key/target 快照，對每個有效的 `hi` 執行
-  一次 64-byte keyed BLAKE3，使用 unsigned 32-bit 加法與原本的 little-endian
-  target comparison。保留 `[strip][hi][band]` 命中編碼。
-- AICPU 每次清除全部 live hit record，最多在 record 0 發布一個有效 hit，
-  並以 `AscendC::DataStoreBarrier()` 完成結果寫入。
-- Host 的槽位完成事件位於 AICPU 與結果 D2H 之後；四個槽位都必須等這個事件
-  才能重用。跨 stream 的同步 event 由 `aclrtCreateEventExWithFlag` 建立，
-  僅以 `RecordEvent` 再次記錄來重用，不呼叫不支援的 `aclrtResetEvent`。
-- `PRL_NOFOLD` 仍僅供診斷，輸出原本的 accumulator prefix；AICPU 跳過 hash，
-  清除 hit，不會把無效 transcript 當成有效 share。
-
-預設 `MDIM=16384` 時，新增的 GM transcript 為 1 MiB/strip，四槽共 4 MiB。
-只有既有診斷 API 要求時才配置 host transcript 與執行 transcript D2H；
-正式路徑只回傳原有的 padded hit record。
-
-## 已執行的檢查
-
-`tests/test_aicpu_blake3.cpp` 可用一般 64-bit C++ compiler 執行，不需 CANN。
-檢查官方 64-byte keyed BLAKE3 向量、target 相等與 limb 順序、transcript
-strided gathering、命中索引、`n_hi=1/4/64`、不同 key/strip 的結果區重用、
-舊 hit 清除、診斷跳過 hash，以及輸入邊界。
-
-```bash
-g++ -std=c++11 -O2 -Wall -Wextra -Werror \
-  -fsanitize=address,undefined -fno-omit-frame-pointer \
-  tests/test_aicpu_blake3.cpp -o /tmp/test_aicpu_blake3
-ASAN_OPTIONS=detect_leaks=0 /tmp/test_aicpu_blake3
-```
-
-結果：PASS。`detect_leaks=0` 是因本次測試環境的 `/proc` 限制，AddressSanitizer
-與 UndefinedBehaviorSanitizer 仍啟用。沒有測得 NPU 加速幅度，也沒有宣稱此版本
-比原版更快。
-
-## 實機確認
-
-1. 用原 GitHub Actions 編譯；啟動時應同時看到 `hash=AICPU` 與
-   `events=Ex/no-reset-v2`，可確認實際載入的是本次修正版。
-2. 與原版在同一設備、相同 pool/job shape、相同執行條件下比較穩定後 iter/s。
-3. 確認 share 仍通過既有 proof/pool 驗證，沒有新增 invalid share 或 timeout。
-4. 若使用 profiler，應看到 `pearl_blake3_aicpu` 與下一個 Vector kernel 的重疊。
-
-這是單一 batched AICPU 任務的版本；AICPU 吞吐與排程成本可能成為新瓶頸，
-效能改善必須實測。
-
-## 207000 event 修正
-
-第一版誤將 `aclrtCreateEventExWithFlag(..., ACL_EVENT_SYNC)` 建立的事件傳給
-`aclrtResetEvent`。這種 Ex event 不支援 reset；支援的重用方式是重新 record，
-wait 呼叫則取得當次已記錄的 stream progress。
-
-本次同時移除 scan-ready 與 fold-ready 的兩處 reset，保留以下時序：
-
-- scan-ready：Cube stream record → Vector stream wait；下一次 scan 前須排空槽位。
-- fold-ready：Vector stream record → AICPU stream wait → hash → D2H → slot done。
-- Host 等到 slot done 才能重用該槽位、重新記錄它的 fold-ready event。
-
-未新增 host 同步等待、編譯開關或效能插樁。Makefile、GitHub Actions、BLAKE3
-與 fold 迴圈的運算沒有因本次 event 修正而改變。
+使用者回報完整 AICPU hash 版約 AI Cpu 16%、AI Cube 9–16%、NPU Util 100%。
+這些整體百分比不能單獨證明瓶頸；單個 AICPU 任務可能受少數核心或排程限制。
+此版本不再逐 strip 提交 AICPU hash，應以穩定後 iter/s 與 profiler 確認效果。
 
 ## 參考
 
-- [CANN 9.0 AI CPU Operator Compilation](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00050.html)
-- [DataStoreBarrier](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/AI-CPU-API/DataStoreBarrier.md)
+- [官方 BLAKE3 reference](https://github.com/BLAKE3-team/BLAKE3/blob/master/reference_impl/reference_impl.rs)
 - [官方 BLAKE3 test vectors](https://github.com/BLAKE3-team/BLAKE3/blob/master/test_vectors/test_vectors.json)
-- [CANN Runtime Event 管理：Ex event 限制與 re-record 語義](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/07_event_management.md)
+- [CANN AI CPU 編譯](https://www.hiascend.com/doc_center/source/en/CANNCommunityEdition/900/programug/Ascendcopdevg/atlas_ascendc_10_00050.html)
+- [CANN Event 管理與 Ex event 限制](https://github.com/hicann/runtime/blob/master/docs/zh/api_ref/07_event_management.md)

@@ -10,7 +10,7 @@ set(PEARL_PIPE_DEPTH "4" CACHE STRING "host strip queue depth")
 set(BUFS "4" CACHE STRING "slot ping-pong depth")
 set(BACKOFF "500" CACHE STRING "spin backoff iters")
 set(VEC2X "2" CACHE STRING "vec consumers per cube producer")
-add_library(pearl_hlc2 SHARED pearl_hlc2_cube.asc pearl_hlc2_vec.asc pearl_blake3.aicpu)
+add_library(pearl_hlc2 SHARED pearl_hlc2_cube.asc pearl_hlc2_vec.asc pearl_blake3_precompute.aicpu)
 # The ASC linker packages the AICPU device image and adds its runtime dependencies.
 set_target_properties(pearl_hlc2 PROPERTIES POSITION_INDEPENDENT_CODE ON LINKER_LANGUAGE ASC)
 target_link_libraries(pearl_hlc2 PRIVATE tiling_api register platform m dl pthread)

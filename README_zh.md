@@ -7,11 +7,11 @@
 
 > **免责声明：** 仅供学习研究之用。请仅在你拥有授权的硬件上运行。
 
-此 AICPU 版本沿用預設四槽的主機非同步流水線。Vector 負責 fold，將 transcript
-寫入 GM；每個 strip 由獨立 stream 的一個 AICPU 任務執行 keyed BLAKE3 與
-target comparison。此修改版本尚未在本編輯環境進行 CANN 編譯或 NPU 實測。
-沿用 `make RANK=128`，不需要新增 make 參數或啟用開關；詳見
-[AICPU_BLAKE3.md](AICPU_BLAKE3.md)。
+此版本只讓 AICPU 在每次更新 key/target 時準備一次 128-byte BLAKE3 context，
+寫入 GM/HBM 供 Vector 讀取。Vector 保留全部依賴 transcript 的 mixing 與 target
+comparison，沿用原本四槽流水線與 fold 排程。仍使用 `make RANK=128`，沒有新增
+編譯或執行開關。此編輯環境沒有 CANN/NPU，尚未驗證本次版本的完整編譯與實機效能。
+詳見 [AICPU_BLAKE3.md](AICPU_BLAKE3.md)。
 
 ## 快速开始
 

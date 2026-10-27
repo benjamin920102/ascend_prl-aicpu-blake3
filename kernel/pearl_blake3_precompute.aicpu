@@ -1,0 +1,13 @@
+/* One tiny task per scan/key update. No transcript input, hash rounds or hit scan. */
+#include "aicpu_api.h"
+#include "pearl_blake3_precomp.h"
+
+__global__ __aicpu__ uint32_t pearl_blake3_precompute(void* rawArgs)
+{
+    const auto& args = *static_cast<const PearlBlake3PrepArgs*>(rawArgs);
+    if (!args.output) return 1;
+    PearlBlake3Prepare(*args.output, args.key, args.target);
+    // Publish the prepared context to GM before the prep-ready event completes.
+    AscendC::DataStoreBarrier();
+    return 0;
+}

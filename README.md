@@ -9,12 +9,13 @@ coin on Huawei **Ascend 910B** NPUs. Tested on a 910B4; it does **~10 TH/s/devic
 
 > **DISCLAMER:** for educational purpose only. Use only with hardware you are authorized to.
 
-This AICPU variant uses the existing four-slot asynchronous host pipeline. Vector
-folds cube partials and exports transcripts to GM; one batched AICPU task per
-strip performs keyed BLAKE3 and target comparison on a separate stream. The
-AICPU variant has not yet been compiled with CANN or benchmarked on a device in
-this editing environment. Build as before with `make RANK=128`; no additional
-make flags or runtime opt-in are needed. See [AICPU_BLAKE3.md](AICPU_BLAKE3.md).
+This variant uses AICPU only to prepare a 128-byte key-dependent BLAKE3 context
+once per scan/key update and writes it to GM/HBM. Vector reads the context once
+per kernel, then performs all transcript-dependent BLAKE3 mixing and target
+comparison. The original four-slot Cube/Vector pipeline and fold schedule remain.
+Build with `make RANK=128`; no extra build or runtime switch is required. This
+preprocessing variant has not been compiled with CANN or benchmarked on an NPU
+in this editing environment. See [AICPU_BLAKE3.md](AICPU_BLAKE3.md).
 
 ## Quickstart
 

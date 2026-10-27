@@ -1,4 +1,4 @@
-/* Submit strips to the NPU; Vector folds, AICPU hashes and checks tile hits. */
+/* Submit single strips to the NPU; the vector kernel hashes and checks tile hits. */
 #include <stdint.h>
 #include <string.h>
 #include "pearl_pipeline.h"
